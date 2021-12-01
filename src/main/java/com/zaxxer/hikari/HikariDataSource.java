@@ -92,6 +92,7 @@ public class HikariDataSource extends HikariConfig implements DataSource, Closea
    @Override
    public Connection getConnection() throws SQLException
    {
+      // 1. 当前数据源是否关闭
       if (isClosed()) {
          throw new SQLException("HikariDataSource " + this + " has been closed.");
       }
@@ -100,14 +101,17 @@ public class HikariDataSource extends HikariConfig implements DataSource, Closea
          return fastPathPool.getConnection();
       }
 
+      // 2. pool(HikariPool类型是否为空) synchronized同步锁，双重检查
       // See http://en.wikipedia.org/wiki/Double-checked_locking#Usage_in_Java
       HikariPool result = pool;
       if (result == null) {
          synchronized (this) {
             result = pool;
             if (result == null) {
+               // 2.1 校验配置属性是否合理合法
                validate();
                LOGGER.info("{} - Starting...", getPoolName());
+               // 2.2 初始化pool，且将当前数据源的config信息传过去，用于初始化属性 new HikarPool(config)
                try {
                   pool = result = new HikariPool(this);
                   this.seal();
