@@ -56,25 +56,38 @@ import static java.util.concurrent.locks.LockSupport.parkNanos;
  *
  * @param <T> the templated type to store in the bag
  */
-public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseable
-{
+public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseable {
    private static final Logger LOGGER = LoggerFactory.getLogger(ConcurrentBag.class);
-
+   /**
+    * 保存容器内所有元素，使用CopyOnWriteArrayList，写操作加锁并复制底层数据，适用于读多写少的场景。
+    * HikariCP作者建议连接池最大连接数与最小连接数保持一致，这可能也是其中一个原因。
+    * 如果连接池配置为弹性容量，遇到突发流量，sharedList扩张就导致CopyOnWriteArrayList加锁并做数组拷贝；
+    * 流量过后，sharedList收缩也会导致加锁和数组拷贝
+    */
    private final CopyOnWriteArrayList<T> sharedList;
+   // 是否开启ThreadLocal保存元素
    private final boolean weakThreadLocals;
-
+   // 当前线程持有的元素
    private final ThreadLocal<List<Object>> threadList;
+   // IBagStateListener（HikariPool）
    private final IBagStateListener listener;
+   // 等待者数量
    private final AtomicInteger waiters;
    private volatile boolean closed;
 
+   // 交接队列
    private final SynchronousQueue<T> handoffQueue;
 
+   // ConcurrentBag中的元素
    public interface IConcurrentBagEntry
    {
+      // 未使用。可以被借走
       int STATE_NOT_IN_USE = 0;
+      // 正在使用
       int STATE_IN_USE = 1;
+      // 被移除，只有调用remove方法时会CAS改变为这个状态，修改成功后会从容器中被移除。
       int STATE_REMOVED = -1;
+      // 被保留，不能被使用。往往是移除前执行保留操作。
       int STATE_RESERVED = -2;
 
       boolean compareAndSet(int expectState, int newState);
@@ -82,8 +95,10 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
       int getState();
    }
 
+   // 用于通知外部，ConcurrentBag需要添加元素了
    public interface IBagStateListener
    {
+      // waiting表示需要添加几个元素
       void addBagItem(int waiting);
    }
 
@@ -119,22 +134,28 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
     */
    public T borrow(long timeout, final TimeUnit timeUnit) throws InterruptedException
    {
+      // 1. 从线程变量中获取
       // Try the thread-local list first
       final var list = threadList.get();
       for (int i = list.size() - 1; i >= 0; i--) {
          final var entry = list.remove(i);
-         @SuppressWarnings("unchecked")
-         final T bagEntry = weakThreadLocals ? ((WeakReference<T>) entry).get() : (T) entry;
+         @SuppressWarnings("unchecked") final T bagEntry = weakThreadLocals ? ((WeakReference<T>) entry).get() : (T) entry;
+         // CAS修改元素状态为使用中
+         // 因为元素可能被其他线程偷取，所以要cas修改状态
          if (bagEntry != null && bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
             return bagEntry;
          }
       }
 
+      // 增加等待线程数量
       // Otherwise, scan the shared list ... then poll the handoff queue
       final int waiting = waiters.incrementAndGet();
       try {
+         // 2. 从共享列表里获取
          for (T bagEntry : sharedList) {
+            // CAS修改元素状态为使用中
             if (bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
+               // 如果不止有当前线程等待，可能偷取了别人的元素，通知外部放入元素
                // If we may have stolen another waiter's connection, request another bag add.
                if (waiting > 1) {
                   listener.addBagItem(waiting - 1);
@@ -143,22 +164,26 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
             }
          }
 
+         // 通知外部添加元素
          listener.addBagItem(waiting);
-
+         // 超时时间
          timeout = timeUnit.toNanos(timeout);
          do {
             final var start = currentTime();
+            // 3. 尝试从交接队列获取元素
             final T bagEntry = handoffQueue.poll(timeout, NANOSECONDS);
+            // CAS修改元素状态为使用中
             if (bagEntry == null || bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
                return bagEntry;
             }
-
+            // timeout -= 本次循环消耗时间
             timeout -= elapsedNanos(start);
          } while (timeout > 10_000);
 
          return null;
       }
       finally {
+         // 减少等待者数量
          waiters.decrementAndGet();
       }
    }
@@ -206,10 +231,16 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
          throw new IllegalStateException("ConcurrentBag has been closed, ignoring add()");
       }
 
+      // 放入sharedList，此时其他线程已经可以获取这个元素了
       sharedList.add(bagEntry);
 
+      // 持续尝试将元素放入交接队列
+      // waiters.get() > 0：需要有正在等待获取元素的线程，才会循环。
+      // bagEntry.getState() == STATE_NOT_IN_USE：因为元素已经放入shareList了，可能被其他线程改变状态，需要判断当前元素仍然是未使用状态。
+      // !handoffQueue.offer(bagEntry)：尝试放入交接队列，如果失败继续循环。
       // spin until a thread takes it or none are waiting
       while (waiters.get() > 0 && bagEntry.getState() == STATE_NOT_IN_USE && !handoffQueue.offer(bagEntry)) {
+         // 当前线程主动放弃cpu执行，回到就绪状态
          Thread.yield();
       }
    }

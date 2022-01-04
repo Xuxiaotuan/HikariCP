@@ -153,6 +153,7 @@ abstract class PoolBase
             final var validationSeconds = (int) Math.max(1000L, validationTimeout) / 1000;
 
             if (isUseJdbc4Validation) {
+               // connection.isValid的实现是ping 速度是 select 1的俩倍
                return !connection.isValid(validationSeconds);
             }
 

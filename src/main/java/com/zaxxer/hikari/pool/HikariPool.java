@@ -60,7 +60,7 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
    public static final int POOL_NORMAL = 0;
    public static final int POOL_SUSPENDED = 1;
    public static final int POOL_SHUTDOWN = 2;
-
+   // 连接池状态
    public volatile int poolState;
 
    private final long aliveBypassWindowMs = Long.getLong("com.zaxxer.hikari.aliveBypassWindowMs", MILLISECONDS.toMillis(500));
@@ -69,17 +69,21 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
    private static final String EVICTED_CONNECTION_MESSAGE = "(connection was evicted)";
    private static final String DEAD_CONNECTION_MESSAGE = "(connection is dead)";
 
+   // 实现Callable，负责创建连接
    private final PoolEntryCreator poolEntryCreator = new PoolEntryCreator();
    private final PoolEntryCreator postFillPoolEntryCreator = new PoolEntryCreator("After adding ");
    private final AtomicInteger addConnectionQueueDepth = new AtomicInteger();
+   // 创建连接的线程池
    private final ThreadPoolExecutor addConnectionExecutor;
+   // 关闭连接的线程池
    private final ThreadPoolExecutor closeConnectionExecutor;
-
+   // Hikari为连接池设计的一个并发类，类比LinkedBlockingQueue
    private final ConcurrentBag<PoolEntry> connectionBag;
-
+   // 创建ProxyLeakTask工厂（ProxyLeakTask用于检测连接泄露）
    private final ProxyLeakTaskFactory leakTaskFactory;
+   // 为连接池挂起和恢复封装的信号量
    private final SuspendResumeLock suspendResumeLock;
-
+   // 执行HouseKeeper任务的线程池，HouseKeeper用于维持最小连接数
    private final ScheduledExecutorService houseKeepingExecutorService;
    private ScheduledFuture<?> houseKeeperTask;
 
@@ -167,11 +171,11 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
             }
 
             final var now = currentTime();
-            if (poolEntry.isMarkedEvicted() || (elapsedMillis(poolEntry.lastAccessed, now) > aliveBypassWindowMs && isConnectionDead(poolEntry.connection))) {
+            if (poolEntry.isMarkedEvicted() ||
+               (elapsedMillis(poolEntry.lastAccessed, now) > aliveBypassWindowMs && isConnectionDead(poolEntry.connection))) {
                closeConnection(poolEntry, poolEntry.isMarkedEvicted() ? EVICTED_CONNECTION_MESSAGE : DEAD_CONNECTION_MESSAGE);
                timeout = hardTimeout - elapsedMillis(startTime);
-            }
-            else {
+            } else {
                metricsTracker.recordBorrowStats(poolEntry, startTime);
                return poolEntry.createProxyConnection(leakTaskFactory.schedule(poolEntry));
             }
